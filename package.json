@@ -1,0 +1,17 @@
+{
+  "name": "lawkick-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Law-Kick 백엔드: 학습 기록 저장 및 LLM 맞춤형 문제 생성 API",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "devDependencies": {
+    "vercel": "^39.0.0"
+  }
+}
