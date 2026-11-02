@@ -1,6 +1,6 @@
 {
   "name": "lawkick-backend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Law-Kick 백엔드: 학습 기록 저장 및 LLM 맞춤형 문제 생성 API",
   "type": "module",
@@ -8,8 +8,12 @@
     "node": ">=18"
   },
   "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "local": "vercel dev",
+    "deploy": "vercel --prod",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.118.0"
   },
   "devDependencies": {
     "vercel": "^39.0.0"
