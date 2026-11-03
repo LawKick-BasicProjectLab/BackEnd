@@ -1,18 +1,9 @@
 // api/quiz/submit.js
-// POST /api/quiz/submit — 문제 풀이 결과 저장 (담당: 백엔드 A)
-//
-// 하는 일
-//   1) 입력 검증
-//   2) 사용자(profiles) 찾기/만들기
-//   3) 풀이 이력(quiz_logs) 저장 + 오늘 방문(visits) 기록
-//   4) 정답이면 등급·경험치를 서버에서 계산해 stage_clears / user_progress 갱신
-//   5) 풀이 수가 기준(기본 10)을 넘으면 맞춤 문제 해금
-//
-// 응답 형식은 기존 명세를 유지하고, 새 값은 data 안에만 추가했다.
+// POST /api/quiz/submit — 문제 풀이 결과 및 클리어 기록 저장 (안정성 강화 버전)
 
 import { store as defaultStore } from '../../lib/store.js';
 import { ok, fail, rejectMethod, readBody, isGuest, validUserId } from '../../lib/http.js';
-import { normalizeCategory, calcReward, levelOf, GRADE_RANK, customUnlockThreshold } from '../../lib/game.js';
+import { normalizeCategory, calcReward, cluesPerStage, levelOf, GRADE_RANK, customUnlockThreshold } from '../../lib/game.js';
 
 const SAVED_MESSAGE = '정오답 데이터가 안전하게 저장되었습니다.';
 
@@ -56,7 +47,8 @@ export function validateSubmit(body) {
     cluesFound: optionalInt(body, 'clues_found', 0, 10, errors),
     questionsLeft: optionalInt(body, 'questions_left', 0, 100, errors),
     nickname: undefined,
-    rankPublic: undefined
+    rankPublic: undefined,
+    revealed: body.revealed === true   // '정답과 해설 보기'로 넘어간 경우 (C등급 클리어)
   };
 
   if (nickname !== undefined && nickname !== null) {
@@ -75,7 +67,6 @@ export function validateSubmit(body) {
   return { input };
 }
 
-/** 테스트에서 가짜 store 를 넣을 수 있도록 만든 생성 함수 */
 export function createSubmitHandler(store) {
   return async function handler(req, res) {
     if (rejectMethod(req, res, ['POST'])) return;
@@ -92,21 +83,46 @@ export function createSubmitHandler(store) {
 
     const base = { user_id: input.userId, stage_id: input.stageId, is_correct: input.isCorrect };
 
-    // 게스트 둘러보기는 저장하지 않는다 (랭킹·통계 오염 방지)
     if (isGuest(input.userId)) {
       return ok(res, { ...base, saved: false, recorded_at: new Date().toISOString() },
         '게스트 모드라 학습 기록을 서버에 저장하지 않았습니다.');
     }
 
     try {
-      // 1. 사용자
+      // 1. 사용자 프로필 생성 또는 찾기 (external_id 기준)
       const profile = await store.upsertProfile(input.userId, {
         nickname: input.nickname, rankPublic: input.rankPublic
       });
+      
+      const realUserId = profile.id; // profiles 테이블의 UUID 고유 ID
 
-      // 2. 풀이 이력 + 방문
+      // 1-1. 정답 공개(reveal): 새로운 풀이가 아니므로 quiz_logs·total_solved 는 건드리지 않고
+      //      클리어 기록이 없을 때만 C등급 + 5 XP 를 준다 (프론트 reveal() 과 같은 규칙)
+      if (input.revealed) {
+        const prev = await store.getClear(realUserId, input.stageId);
+        let xpGained = 0;
+        if (!prev && await store.insertClear(realUserId, input.stageId, 'C')) {
+          xpGained = 5;
+          console.log(`[submit] 👀 정답 공개 클리어 저장: user=${realUserId}, stage=${input.stageId}, grade=C`);
+        }
+        const progress = await store.getProgress(realUserId);
+        const xp = (progress?.xp || 0) + xpGained;
+        if (xpGained) await store.updateProgress(realUserId, { xp });
+        return ok(res, {
+          ...base,
+          saved: true,
+          revealed: true,
+          first_clear: xpGained > 0,
+          grade: prev ? prev.grade : 'C',
+          xp_gained: xpGained,
+          xp,
+          level: levelOf(xp)
+        }, SAVED_MESSAGE);
+      }
+
+      // 2. 풀이 이력(quiz_logs) 저장 + 방문(visits) 기록
       const recordedAt = await store.insertLog({
-        user_id: profile.id,
+        user_id: realUserId,
         stage_id: input.stageId,
         category: input.category,
         is_correct: input.isCorrect,
@@ -115,39 +131,49 @@ export function createSubmitHandler(store) {
         clues_found: input.cluesFound,
         questions_left: input.questionsLeft
       });
-      await store.recordVisit(profile.id);
+      await store.recordVisit(realUserId);
 
-      // 3. 보상 (처음 클리어할 때만 경험치, 다시 풀면 등급만 올라감 — 프론트와 동일)
-      const reward = calcReward(input);
+      // 3. 정답일 경우 stage_clears 기록 보장 (저장 누락 방지를 위한 upsert 적용)
       let xpGained = 0;
       let firstClear = false;
       let grade = null;
 
-      if (reward) {
-        const prev = await store.getClear(profile.id, input.stageId);
-        if (!prev) {
-          await store.insertClear(profile.id, input.stageId, reward.grade);
+      const reward = calcReward({ ...input, cluesTotal: cluesPerStage(input.category) });
+      if (reward && input.isCorrect) {
+        grade = reward.grade;
+        const prev = await store.getClear(realUserId, input.stageId);
+        
+        // 기록이 없으면 새로 삽입. 동시에 들어온 다른 요청이 먼저 넣었다면(insert 가 false) 이미 있는 것으로 처리
+        const inserted = !prev && await store.insertClear(realUserId, input.stageId, grade);
+        if (inserted) {
           xpGained = reward.xp;
           firstClear = true;
-          grade = reward.grade;
-        } else if (GRADE_RANK[reward.grade] > GRADE_RANK[prev.grade]) {
-          await store.updateClearGrade(profile.id, input.stageId, reward.grade);
-          grade = reward.grade;
+          console.log(`[submit] 🌟 신규 클리어 저장 완료: user=${realUserId}, stage=${input.stageId}, grade=${grade}`);
+        } else if (!prev) {
+          grade = (await store.getClear(realUserId, input.stageId))?.grade ?? grade;
+          console.log(`[submit] ⏭️ 동시 제출로 이미 저장된 클리어: user=${realUserId}, stage=${input.stageId}`);
         } else {
-          grade = prev.grade;
+          // 이미 기록이 있다면 더 높은 등급일 때만 갱신
+          if (GRADE_RANK[grade] > GRADE_RANK[prev.grade]) {
+            await store.updateClearGrade(realUserId, input.stageId, grade);
+            console.log(`[submit] 📈 클리어 등급 갱신: user=${realUserId}, stage=${input.stageId}, ${prev.grade} -> ${grade}`);
+          } else {
+            grade = prev.grade;   // 더 낮은 등급이면 기존(더 높은) 등급 유지
+          }
         }
       }
 
-      // 4. 누적 상태
-      const progress = await store.getProgress(profile.id);
-      const xp = progress.xp + xpGained;
-      const totalSolved = progress.total_solved + 1;
-      const customUnlocked = progress.custom_unlocked || totalSolved >= customUnlockThreshold();
-      await store.updateProgress(profile.id, {
+      // 4. 누적 경험치 및 프로그레스 갱신
+      const progress = await store.getProgress(realUserId);
+      const xp = (progress?.xp || 0) + xpGained;
+      const totalSolved = (progress?.total_solved || 0) + 1;
+      const customUnlocked = progress?.custom_unlocked || totalSolved >= customUnlockThreshold();
+      
+      await store.updateProgress(realUserId, {
         xp, total_solved: totalSolved, custom_unlocked: customUnlocked
       });
 
-      console.log(`[submit] stage=${input.stageId} correct=${input.isCorrect} xp+${xpGained}`);
+      console.log(`[submit] 저장 성공: stage=${input.stageId} correct=${input.isCorrect} xp+${xpGained}`);
 
       return ok(res, {
         ...base,
@@ -164,7 +190,7 @@ export function createSubmitHandler(store) {
       }, SAVED_MESSAGE);
 
     } catch (err) {
-      console.error('[submit] 저장 실패:', err.message);
+      console.error('[submit] 데이터 저장 실패 상세 에러:', err.message);   // 상세 내용은 서버 로그에만
       return fail(res, 500, '서버 내부 오류가 발생했습니다.');
     }
   };
