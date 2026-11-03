@@ -40,10 +40,16 @@ export function createMemoryStore() {
       return db.clears.find(c => c.user_id === userId && c.stage_id === stageId) || null;
     },
     async insertClear(user_id, stage_id, grade) {
+      if (db.clears.some(c => c.user_id === user_id && c.stage_id === stage_id)) return false;   // 실제 DB 의 unique 제약과 같게
       db.clears.push({ user_id, stage_id, grade, cleared_at: new Date().toISOString() });
+      return true;
     },
     async updateClearGrade(userId, stageId, grade) {
       (await this.getClear(userId, stageId)).grade = grade;
+    },
+    async resetProgress(userId) {
+      db.clears = db.clears.filter(c => c.user_id !== userId);
+      Object.assign(db.progress.get(userId), { xp: 0, coins: 30, total_solved: 0, custom_unlocked: false });
     },
     async listClears(userId) {
       return db.clears.filter(c => c.user_id === userId).map(({ stage_id, grade, cleared_at }) => ({ stage_id, grade, cleared_at }));
